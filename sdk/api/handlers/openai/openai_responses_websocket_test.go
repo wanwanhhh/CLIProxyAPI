@@ -26,6 +26,8 @@ import (
 type websocketCaptureExecutor struct {
 	streamCalls int
 	payloads    [][]byte
+	modes       []bool
+	provider    string
 }
 
 type websocketCompactionCaptureExecutor struct {
@@ -106,15 +108,29 @@ func (e *websocketAuthCaptureExecutor) AuthIDs() []string {
 	return append([]string(nil), e.authIDs...)
 }
 
-func (e *websocketCaptureExecutor) Identifier() string { return "test-provider" }
+func (e *websocketCaptureExecutor) Identifier() string {
+	if strings.TrimSpace(e.provider) != "" {
+		return e.provider
+	}
+	return "test-provider"
+}
 
 func (e *websocketCaptureExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
 	return coreexecutor.Response{}, errors.New("not implemented")
 }
 
-func (e *websocketCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+func websocketTransparentMetadataEnabled(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	enabled, _ := meta[coreexecutor.TransparentWebsocketModeMetadataKey].(bool)
+	return enabled
+}
+
+func (e *websocketCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	e.streamCalls++
 	e.payloads = append(e.payloads, bytes.Clone(req.Payload))
+	e.modes = append(e.modes, websocketTransparentMetadataEnabled(opts.Metadata))
 	chunks := make(chan coreexecutor.StreamChunk, 1)
 	chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"resp-upstream","output":[{"type":"message","id":"out-1"}]}}`)}
 	close(chunks)
@@ -131,6 +147,12 @@ func (e *websocketCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, 
 
 func (e *websocketCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
 	return nil, errors.New("not implemented")
+}
+
+func (e *websocketCaptureExecutor) TransparentModes() []bool {
+	out := make([]bool, len(e.modes))
+	copy(out, e.modes)
+	return out
 }
 
 func (e *websocketCompactionCaptureExecutor) Identifier() string { return "test-provider" }
@@ -968,6 +990,169 @@ func TestResponsesWebsocketPrewarmHandledLocallyForSSEUpstream(t *testing.T) {
 	input := gjson.GetBytes(forwarded, "input").Array()
 	if len(input) != 1 || input[0].Get("id").String() != "msg-1" {
 		t.Fatalf("unexpected forwarded input: %s", forwarded)
+	}
+}
+
+func TestPrepareResponsesWebsocketTransparentRequestPreservesAppendSemantics(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5","input":[{"type":"message","id":"msg-1"}]}`)
+	raw := []byte(`{"type":"response.append","previous_response_id":"resp-1","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`)
+
+	requestJSON, snapshot, errMsg := prepareResponsesWebsocketTransparentRequest(raw, lastRequest)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	if !bytes.Equal(requestJSON, raw) {
+		t.Fatalf("requestJSON changed.\nGot:  %s\nWant: %s", requestJSON, raw)
+	}
+	if got := gjson.GetBytes(requestJSON, "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("previous_response_id = %q, want %q", got, "resp-1")
+	}
+	if gjson.GetBytes(requestJSON, "model").Exists() {
+		t.Fatalf("forwarded append request should stay model-less: %s", requestJSON)
+	}
+	if got := gjson.GetBytes(snapshot, "model").String(); got != "gpt-5" {
+		t.Fatalf("snapshot model = %q, want %q", got, "gpt-5")
+	}
+	if len(gjson.GetBytes(snapshot, "input").Array()) != 1 {
+		t.Fatalf("snapshot input was unexpectedly merged: %s", snapshot)
+	}
+}
+
+func TestResponsesWebsocketTransparentModeBypassesLocalPrewarm(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &websocketCaptureExecutor{provider: "codex"}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{
+		ID:         "auth-ws",
+		Provider:   executor.Identifier(),
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Codex: sdkconfig.CodexConfig{
+			TransparentWebsocketMode: true,
+		},
+	}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			t.Fatalf("close websocket: %v", errClose)
+		}
+	}()
+
+	request := `{"type":"response.create","model":"gpt-5","generate":false,"previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(request)); errWrite != nil {
+		t.Fatalf("write websocket message: %v", errWrite)
+	}
+
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read websocket message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("payload type = %s, want %s", got, wsEventTypeCompleted)
+	}
+	if executor.streamCalls != 1 {
+		t.Fatalf("stream calls = %d, want 1", executor.streamCalls)
+	}
+	if len(executor.payloads) != 1 {
+		t.Fatalf("captured upstream payloads = %d, want 1", len(executor.payloads))
+	}
+	forwarded := executor.payloads[0]
+	if got := gjson.GetBytes(forwarded, "type").String(); got != wsRequestTypeCreate {
+		t.Fatalf("forwarded type = %q, want %q", got, wsRequestTypeCreate)
+	}
+	if got := gjson.GetBytes(forwarded, "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("forwarded previous_response_id = %q, want %q", got, "resp-1")
+	}
+	if !gjson.GetBytes(forwarded, "generate").Exists() || gjson.GetBytes(forwarded, "generate").Bool() {
+		t.Fatalf("forwarded generate flag = %s, want explicit false", forwarded)
+	}
+	if gotModes := executor.TransparentModes(); len(gotModes) != 1 || !gotModes[0] {
+		t.Fatalf("transparent metadata flags = %v, want [true]", gotModes)
+	}
+}
+
+func TestResponsesWebsocketNonTransparentCodexRequestDoesNotForwardTransparentMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &websocketCaptureExecutor{provider: "codex"}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{
+		ID:       "auth-sse",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Codex: sdkconfig.CodexConfig{
+			TransparentWebsocketMode: true,
+		},
+	}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			t.Fatalf("close websocket: %v", errClose)
+		}
+	}()
+
+	request := `{"type":"response.create","model":"gpt-5","input":[{"type":"message","id":"msg-1"}]}`
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(request)); errWrite != nil {
+		t.Fatalf("write websocket message: %v", errWrite)
+	}
+
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read websocket message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("payload type = %s, want %s", got, wsEventTypeCompleted)
+	}
+	if executor.streamCalls != 1 {
+		t.Fatalf("stream calls = %d, want 1", executor.streamCalls)
+	}
+	if gotModes := executor.TransparentModes(); len(gotModes) != 1 || gotModes[0] {
+		t.Fatalf("transparent metadata flags = %v, want [false]", gotModes)
 	}
 }
 

@@ -379,15 +379,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := req.Payload
-
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err := prepareCodexWebsocketStreamBody(e.cfg, req, opts)
 	if err != nil {
 		return nil, err
 	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -693,6 +688,49 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 			}
 			return ev.msgType, ev.payload, nil
 		}
+	}
+}
+
+func prepareCodexWebsocketStreamBody(cfg *config.Config, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) ([]byte, error) {
+	body := req.Payload
+	if codexTransparentWebsocketModeFromOptions(opts) {
+		return body, nil
+	}
+
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("codex")
+
+	var err error
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), "codex")
+	if err != nil {
+		return nil, err
+	}
+
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	body = helps.ApplyPayloadConfigWithRoot(cfg, baseModel, to.String(), "", body, body, requestedModel)
+	return body, nil
+}
+
+func codexTransparentWebsocketModeFromOptions(opts cliproxyexecutor.Options) bool {
+	if len(opts.Metadata) == 0 {
+		return false
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.TransparentWebsocketModeMetadataKey]
+	if !ok || raw == nil {
+		return false
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		return err == nil && parsed
+	case []byte:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(string(v)))
+		return err == nil && parsed
+	default:
+		return false
 	}
 }
 

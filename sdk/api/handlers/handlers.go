@@ -56,6 +56,7 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type transparentWebsocketModeContextKey struct{}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -90,6 +91,15 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithTransparentWebsocketMode returns a child context tagged for a confirmed
+// transparent websocket execution branch.
+func WithTransparentWebsocketMode(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, transparentWebsocketModeContextKey{}, true)
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
@@ -186,6 +196,12 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 	return cfg != nil && cfg.PassthroughHeaders
 }
 
+// CodexTransparentWebsocketModeEnabled reports whether Codex transparent-first
+// websocket handling is enabled in the current config.
+func CodexTransparentWebsocketModeEnabled(cfg *config.SDKConfig) bool {
+	return cfg != nil && cfg.Codex.TransparentWebsocketMode
+}
+
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
@@ -251,6 +267,14 @@ func executionSessionIDFromContext(ctx context.Context) string {
 	default:
 		return ""
 	}
+}
+
+func transparentWebsocketModeFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(transparentWebsocketModeContextKey{}).(bool)
+	return enabled
 }
 
 // BaseAPIHandler contains the handlers for API endpoints.
@@ -582,6 +606,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		Model:   normalizedModel,
 		Payload: payload,
 	}
+	transparentCodexWebsocket := transparentWebsocketModeFromContext(ctx)
 	opts := coreexecutor.Options{
 		Stream:          true,
 		Alt:             alt,
@@ -589,6 +614,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
+	if transparentCodexWebsocket {
+		opts.Metadata[coreexecutor.TransparentWebsocketModeMetadataKey] = true
+	}
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
@@ -691,6 +719,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload {
+						if transparentCodexWebsocket {
+							pinSelectedAuthForTransparentRetry(opts.Metadata)
+						}
 						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
@@ -736,6 +767,39 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
+}
+
+func pinSelectedAuthForTransparentRetry(meta map[string]any) {
+	if len(meta) == 0 {
+		return
+	}
+	if raw, ok := meta[coreexecutor.PinnedAuthMetadataKey]; ok && raw != nil {
+		switch v := raw.(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				return
+			}
+		case []byte:
+			if strings.TrimSpace(string(v)) != "" {
+				return
+			}
+		}
+	}
+	raw, ok := meta[coreexecutor.SelectedAuthMetadataKey]
+	if !ok || raw == nil {
+		return
+	}
+	var authID string
+	switch v := raw.(type) {
+	case string:
+		authID = strings.TrimSpace(v)
+	case []byte:
+		authID = strings.TrimSpace(string(v))
+	}
+	if authID == "" {
+		return
+	}
+	meta[coreexecutor.PinnedAuthMetadataKey] = authID
 }
 
 func validateSSEDataJSON(chunk []byte) error {

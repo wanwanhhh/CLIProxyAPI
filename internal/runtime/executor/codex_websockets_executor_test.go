@@ -9,7 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -262,6 +264,50 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "" {
 		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
+	}
+}
+
+func TestPrepareCodexWebsocketStreamBodySkipsPayloadConfigInTransparentMode(t *testing.T) {
+	cfg := &config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{
+				{
+					Models: []config.PayloadModelRule{
+						{Name: "gpt-5", Protocol: "codex"},
+					},
+					Params: map[string]any{
+						"store": true,
+					},
+				},
+			},
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","input":[]}`),
+	}
+
+	normalBody, err := prepareCodexWebsocketStreamBody(cfg, req, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	})
+	if err != nil {
+		t.Fatalf("prepareCodexWebsocketStreamBody(normal) error = %v", err)
+	}
+	if !gjson.GetBytes(normalBody, "store").Bool() {
+		t.Fatalf("normal body should include payload-config override: %s", normalBody)
+	}
+
+	transparentBody, err := prepareCodexWebsocketStreamBody(cfg, req, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.TransparentWebsocketModeMetadataKey: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareCodexWebsocketStreamBody(transparent) error = %v", err)
+	}
+	if gjson.GetBytes(transparentBody, "store").Exists() {
+		t.Fatalf("transparent body should skip payload-config override: %s", transparentBody)
 	}
 }
 

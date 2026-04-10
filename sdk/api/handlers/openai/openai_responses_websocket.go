@@ -103,8 +103,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// )
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now())
 
+		transparentMode := h.responsesWebsocketTransparentModeEnabledForRequest(payload, lastRequest, pinnedAuthID)
+
 		allowIncrementalInputWithPreviousResponseID := false
-		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
+		if transparentMode {
+			allowIncrementalInputWithPreviousResponseID = true
+		} else if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
 			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
 				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
 			}
@@ -119,12 +123,16 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var requestJSON []byte
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
-		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithMode(
-			payload,
-			lastRequest,
-			lastResponseOutput,
-			allowIncrementalInputWithPreviousResponseID,
-		)
+		if transparentMode {
+			requestJSON, updatedLastRequest, errMsg = prepareResponsesWebsocketTransparentRequest(payload, lastRequest)
+		} else {
+			requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithMode(
+				payload,
+				lastRequest,
+				lastResponseOutput,
+				allowIncrementalInputWithPreviousResponseID,
+			)
+		}
 		if errMsg != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			markAPIResponseTimestamp(c)
@@ -147,7 +155,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			continue
 		}
-		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
+		if !transparentMode && shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
 			if updated, errDelete := sjson.DeleteBytes(requestJSON, "generate"); errDelete == nil {
 				requestJSON = updated
 			}
@@ -163,13 +171,21 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
-		requestJSON = repairResponsesWebsocketToolCalls(downstreamSessionKey, requestJSON)
-		updatedLastRequest = bytes.Clone(requestJSON)
+		if !transparentMode {
+			requestJSON = repairResponsesWebsocketToolCalls(downstreamSessionKey, requestJSON)
+		}
+		updatedLastRequest = snapshotResponsesWebsocketRequestForRouting(requestJSON, lastRequest)
 		lastRequest = updatedLastRequest
 
-		modelName := gjson.GetBytes(requestJSON, "model").String()
+		modelName := strings.TrimSpace(gjson.GetBytes(requestJSON, "model").String())
+		if modelName == "" {
+			modelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+		}
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
+		if transparentMode {
+			cliCtx = handlers.WithTransparentWebsocketMode(cliCtx)
+		}
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
 		if pinnedAuthID != "" {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
@@ -198,6 +214,96 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		lastResponseOutput = completedOutput
 	}
+}
+
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketTransparentModeEnabledForRequest(rawJSON []byte, lastRequest []byte, pinnedAuthID string) bool {
+	if h == nil || !handlers.CodexTransparentWebsocketModeEnabled(h.Cfg) {
+		return false
+	}
+	if pinnedAuthID != "" && h.AuthManager != nil {
+		auth, ok := h.AuthManager.GetByID(pinnedAuthID)
+		if !ok || auth == nil {
+			return false
+		}
+		return strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") &&
+			websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata)
+	}
+	requestModelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+	if requestModelName == "" {
+		requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+	}
+	return h.responsesWebsocketTransparentModeEnabledForModel(requestModelName)
+}
+
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketTransparentModeEnabledForModel(modelName string) bool {
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		return false
+	}
+
+	resolvedModelName := modelName
+	initialSuffix := thinking.ParseSuffix(modelName)
+	if initialSuffix.ModelName == "auto" {
+		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+		if initialSuffix.HasSuffix {
+			resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+		} else {
+			resolvedModelName = resolvedBase
+		}
+	} else {
+		resolvedModelName = util.ResolveAutoModel(modelName)
+	}
+
+	parsed := thinking.ParseSuffix(resolvedModelName)
+	baseModel := strings.TrimSpace(parsed.ModelName)
+	providers := util.GetProviderName(baseModel)
+	if len(providers) == 0 && baseModel != resolvedModelName {
+		providers = util.GetProviderName(resolvedModelName)
+	}
+	if len(providers) != 1 || !strings.EqualFold(strings.TrimSpace(providers[0]), "codex") {
+		return false
+	}
+	return h.websocketUpstreamSupportsIncrementalInputForModel(modelName)
+}
+
+func prepareResponsesWebsocketTransparentRequest(rawJSON []byte, lastRequest []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
+	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
+	switch requestType {
+	case wsRequestTypeCreate:
+		return bytes.Clone(rawJSON), snapshotResponsesWebsocketRequestForRouting(rawJSON, lastRequest), nil
+	case wsRequestTypeAppend:
+		if len(lastRequest) == 0 {
+			return nil, lastRequest, &interfaces.ErrorMessage{
+				StatusCode: http.StatusBadRequest,
+				Error:      fmt.Errorf("websocket request received before response.create"),
+			}
+		}
+		return bytes.Clone(rawJSON), snapshotResponsesWebsocketRequestForRouting(rawJSON, lastRequest), nil
+	default:
+		return nil, lastRequest, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf("unsupported websocket request type: %s", requestType),
+		}
+	}
+}
+
+func snapshotResponsesWebsocketRequestForRouting(requestJSON []byte, lastRequest []byte) []byte {
+	if len(requestJSON) == 0 {
+		return nil
+	}
+	snapshot := bytes.Clone(requestJSON)
+	if gjson.GetBytes(snapshot, "model").Exists() {
+		return snapshot
+	}
+	modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+	if modelName == "" {
+		return snapshot
+	}
+	updated, err := sjson.SetBytes(snapshot, "model", modelName)
+	if err != nil {
+		return snapshot
+	}
+	return updated
 }
 
 func websocketClientAddress(c *gin.Context) string {

@@ -135,11 +135,26 @@ type authAwareStreamExecutor struct {
 	mu      sync.Mutex
 	calls   int
 	authIDs []string
+	modes   []bool
 }
 
 type invalidJSONStreamExecutor struct{}
 
 type splitResponsesEventStreamExecutor struct{}
+
+type syncRetryAwareStreamExecutor struct {
+	mu      sync.Mutex
+	authIDs []string
+	modes   []bool
+}
+
+func transparentModeMetadataEnabled(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	enabled, _ := meta[coreexecutor.TransparentWebsocketModeMetadataKey].(bool)
+	return enabled
+}
 
 func (e *invalidJSONStreamExecutor) Identifier() string { return "codex" }
 
@@ -209,7 +224,6 @@ func (e *authAwareStreamExecutor) Execute(context.Context, *coreauth.Auth, coree
 func (e *authAwareStreamExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	_ = ctx
 	_ = req
-	_ = opts
 	ch := make(chan coreexecutor.StreamChunk, 1)
 
 	authID := ""
@@ -220,6 +234,7 @@ func (e *authAwareStreamExecutor) ExecuteStream(ctx context.Context, auth *corea
 	e.mu.Lock()
 	e.calls++
 	e.authIDs = append(e.authIDs, authID)
+	e.modes = append(e.modes, transparentModeMetadataEnabled(opts.Metadata))
 	e.mu.Unlock()
 
 	if authID == "auth1" {
@@ -267,6 +282,81 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.authIDs))
 	copy(out, e.authIDs)
+	return out
+}
+
+func (e *authAwareStreamExecutor) TransparentModes() []bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]bool, len(e.modes))
+	copy(out, e.modes)
+	return out
+}
+
+func (e *syncRetryAwareStreamExecutor) Identifier() string { return "codex" }
+
+func (e *syncRetryAwareStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *syncRetryAwareStreamExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	_ = ctx
+	_ = req
+
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+
+	e.mu.Lock()
+	e.authIDs = append(e.authIDs, authID)
+	e.modes = append(e.modes, transparentModeMetadataEnabled(opts.Metadata))
+	e.mu.Unlock()
+
+	if authID == "auth1" {
+		return nil, &coreauth.Error{
+			Code:       "unauthorized",
+			Message:    "unauthorized",
+			Retryable:  false,
+			HTTPStatus: http.StatusUnauthorized,
+		}
+	}
+
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{Payload: []byte("ok")}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *syncRetryAwareStreamExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *syncRetryAwareStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *syncRetryAwareStreamExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{
+		Code:       "not_implemented",
+		Message:    "HttpRequest not implemented",
+		HTTPStatus: http.StatusNotImplemented,
+	}
+}
+
+func (e *syncRetryAwareStreamExecutor) AuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.authIDs))
+	copy(out, e.authIDs)
+	return out
+}
+
+func (e *syncRetryAwareStreamExecutor) TransparentModes() []bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]bool, len(e.modes))
+	copy(out, e.modes)
 	return out
 }
 
@@ -658,6 +748,221 @@ func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *test
 	}
 	if selectedAuthID != "auth2" {
 		t.Fatalf("selectedAuthID = %q, want %q", selectedAuthID, "auth2")
+	}
+}
+
+func TestExecuteStreamWithAuthManager_TransparentCodexWebsocketPinsBootstrapRetryAuth(t *testing.T) {
+	executor := &authAwareStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:         "auth1",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+		Metadata:   map[string]any{"email": "test1@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+
+	auth2 := &coreauth.Auth{
+		ID:         "auth2",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+		Metadata:   map[string]any{"email": "test2@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth2); err != nil {
+		t.Fatalf("manager.Register(auth2): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	registry.GetGlobalRegistry().RegisterClient(auth2.ID, auth2.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Codex: sdkconfig.CodexConfig{
+			TransparentWebsocketMode: true,
+		},
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries: 1,
+		},
+	}, manager)
+	ctx := WithTransparentWebsocketMode(coreexecutor.WithDownstreamWebsocket(context.Background()))
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai-response", "gpt-5", []byte(`{"model":"gpt-5"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	for range dataChan {
+	}
+	var gotErr error
+	for msg := range errChan {
+		if msg != nil && msg.Error != nil {
+			gotErr = msg.Error
+		}
+	}
+	if gotErr == nil {
+		t.Fatalf("expected terminal error, got nil")
+	}
+
+	authIDs := executor.AuthIDs()
+	if len(authIDs) == 0 {
+		t.Fatalf("expected at least one upstream attempt")
+	}
+	for _, authID := range authIDs {
+		if authID != "auth1" {
+			t.Fatalf("expected transparent retry to stay on auth1, got %v", authIDs)
+		}
+	}
+	for _, enabled := range executor.TransparentModes() {
+		if !enabled {
+			t.Fatalf("expected transparent metadata on all attempts, got %v", executor.TransparentModes())
+		}
+	}
+}
+
+func TestExecuteStreamWithAuthManager_GlobalTransparentModeWithoutConfirmedBranchDoesNotCarryTransparentMetadata(t *testing.T) {
+	executor := &authAwareStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:         "auth1",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+		Metadata:   map[string]any{"email": "test1@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+
+	auth2 := &coreauth.Auth{
+		ID:         "auth2",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+		Metadata:   map[string]any{"email": "test2@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth2); err != nil {
+		t.Fatalf("manager.Register(auth2): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	registry.GetGlobalRegistry().RegisterClient(auth2.ID, auth2.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Codex: sdkconfig.CodexConfig{
+			TransparentWebsocketMode: true,
+		},
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries: 1,
+		},
+	}, manager)
+	ctx := coreexecutor.WithDownstreamWebsocket(context.Background())
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai-response", "gpt-5", []byte(`{"model":"gpt-5"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+	if string(got) != "ok" {
+		t.Fatalf("expected payload ok, got %q", string(got))
+	}
+
+	if gotAuthIDs := executor.AuthIDs(); len(gotAuthIDs) != 2 || gotAuthIDs[0] != "auth1" || gotAuthIDs[1] != "auth2" {
+		t.Fatalf("expected bootstrap retry to rotate auths, got %v", gotAuthIDs)
+	}
+	for _, enabled := range executor.TransparentModes() {
+		if enabled {
+			t.Fatalf("expected no transparent metadata, got %v", executor.TransparentModes())
+		}
+	}
+}
+
+func TestExecuteStreamWithAuthManager_GlobalTransparentModeWithoutConfirmedBranchDoesNotApplyTransparentRetryLimits(t *testing.T) {
+	executor := &syncRetryAwareStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:         "auth1",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+		Metadata:   map[string]any{"email": "test1@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+
+	auth2 := &coreauth.Auth{
+		ID:         "auth2",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+		Metadata:   map[string]any{"email": "test2@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth2); err != nil {
+		t.Fatalf("manager.Register(auth2): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	registry.GetGlobalRegistry().RegisterClient(auth2.ID, auth2.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Codex: sdkconfig.CodexConfig{
+			TransparentWebsocketMode: true,
+		},
+	}, manager)
+	ctx := coreexecutor.WithDownstreamWebsocket(context.Background())
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai-response", "gpt-5", []byte(`{"model":"gpt-5"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+	if string(got) != "ok" {
+		t.Fatalf("expected payload ok, got %q", string(got))
+	}
+
+	if gotAuthIDs := executor.AuthIDs(); len(gotAuthIDs) != 2 || gotAuthIDs[0] != "auth1" || gotAuthIDs[1] != "auth2" {
+		t.Fatalf("expected manager retry to rotate auths, got %v", gotAuthIDs)
+	}
+	for _, enabled := range executor.TransparentModes() {
+		if enabled {
+			t.Fatalf("expected no transparent metadata, got %v", executor.TransparentModes())
+		}
 	}
 }
 

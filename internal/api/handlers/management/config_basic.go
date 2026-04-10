@@ -255,6 +255,14 @@ func (h *Handler) PutWebsocketAuth(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.WebsocketAuth = v })
 }
 
+// Codex transparent websocket mode
+func (h *Handler) GetCodexTransparentWebsocketMode(c *gin.Context) {
+	c.JSON(200, gin.H{"transparent-websocket-mode": h.cfg.Codex.TransparentWebsocketMode})
+}
+func (h *Handler) PutCodexTransparentWebsocketMode(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.Codex.TransparentWebsocketMode = v })
+}
+
 // Request retry
 func (h *Handler) GetRequestRetry(c *gin.Context) {
 	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})

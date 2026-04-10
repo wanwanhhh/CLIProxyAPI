@@ -4,6 +4,14 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+// CodexConfig controls global Codex behavior that is not tied to an individual credential.
+type CodexConfig struct {
+	// TransparentWebsocketMode keeps Codex Responses websocket requests closer to
+	// upstream semantics by disabling proxy-side repair logic when the selected
+	// upstream auth also supports websockets.
+	TransparentWebsocketMode bool `yaml:"transparent-websocket-mode" json:"transparent-websocket-mode"`
+}
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
@@ -34,6 +42,9 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// Codex groups global Codex runtime behavior toggles.
+	Codex CodexConfig `yaml:"codex" json:"codex"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

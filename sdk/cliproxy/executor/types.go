@@ -15,6 +15,9 @@ const (
 	PinnedAuthMetadataKey = "pinned_auth_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
+	// TransparentWebsocketModeMetadataKey marks requests that should preserve
+	// transparent-first websocket semantics across retries and fallback layers.
+	TransparentWebsocketModeMetadataKey = "transparent_websocket_mode"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
