@@ -239,6 +239,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			if codexTransparentWebsocketModeFromOptions(opts) {
+				return resp, transparentWebsocketFallbackForbiddenError(respHS.Header.Clone())
+			}
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -432,6 +435,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			if sess != nil {
+				sess.reqMu.Unlock()
+			}
+			if codexTransparentWebsocketModeFromOptions(opts) {
+				return nil, transparentWebsocketFallbackForbiddenError(respHS.Header.Clone())
+			}
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -1491,10 +1500,29 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
+	if codexTransparentWebsocketModeFromOptions(opts) && !codexWebsocketsEnabled(auth) {
+		return nil, cliproxyexecutor.NewOpenAICompatibleError(
+			http.StatusConflict,
+			"invalid_request_error",
+			"transparent_websocket_auth_required",
+			"transparent websocket mode requires a codex websocket-enabled auth",
+		)
+	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+}
+
+func transparentWebsocketFallbackForbiddenError(headers http.Header) error {
+	err := cliproxyexecutor.NewOpenAICompatibleError(
+		http.StatusBadGateway,
+		"server_error",
+		"transparent_websocket_fallback_forbidden",
+		"transparent websocket mode forbids fallback to the legacy HTTP executor after websocket upgrade failure",
+	)
+	err.HeadersMap = headers
+	return err
 }
 
 func (e *CodexAutoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {

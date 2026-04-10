@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -308,6 +310,180 @@ func TestPrepareCodexWebsocketStreamBodySkipsPayloadConfigInTransparentMode(t *t
 	}
 	if gjson.GetBytes(transparentBody, "store").Exists() {
 		t.Fatalf("transparent body should skip payload-config override: %s", transparentBody)
+	}
+}
+
+func TestCodexAutoExecutorExecuteStreamTransparentModeRequiresWebsocketAuth(t *testing.T) {
+	var postCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			postCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-http",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+
+	_, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","input":[]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.TransparentWebsocketModeMetadataKey: true,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if status := err.(interface{ StatusCode() int }).StatusCode(); status != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", status, http.StatusConflict)
+	}
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "transparent_websocket_auth_required" {
+		t.Fatalf("error.code = %q, want %q", got, "transparent_websocket_auth_required")
+	}
+	if got := postCalls.Load(); got != 0 {
+		t.Fatalf("HTTP fallback POST calls = %d, want 0", got)
+	}
+}
+
+func TestCodexWebsocketsExecutorExecuteStreamTransparentModeForbidsHTTPFallbackOnUpgradeRequired(t *testing.T) {
+	var postCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		if r.Method == http.MethodPost {
+			postCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-ws",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+
+	_, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","input":[]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.TransparentWebsocketModeMetadataKey: true,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if status := err.(interface{ StatusCode() int }).StatusCode(); status != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadGateway)
+	}
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "transparent_websocket_fallback_forbidden" {
+		t.Fatalf("error.code = %q, want %q", got, "transparent_websocket_fallback_forbidden")
+	}
+	if got := postCalls.Load(); got != 0 {
+		t.Fatalf("HTTP fallback POST calls = %d, want 0", got)
+	}
+}
+
+func TestCodexWebsocketsExecutorExecuteStreamNonTransparentModeFallsBackOnUpgradeRequired(t *testing.T) {
+	var postCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		if r.Method == http.MethodPost {
+			postCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-ws",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+
+	streamResult, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","input":[]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "session-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if streamResult == nil {
+		t.Fatal("streamResult = nil")
+	}
+	payloadCount := 0
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		if len(chunk.Payload) > 0 {
+			payloadCount++
+		}
+	}
+	if payloadCount == 0 {
+		t.Fatal("expected fallback stream payload, got none")
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("HTTP fallback POST calls = %d, want 1", got)
+	}
+
+	secondResult, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"model":"gpt-5","input":[]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "session-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("second ExecuteStream() error = %v", err)
+	}
+	if secondResult == nil {
+		t.Fatal("second streamResult = nil")
+	}
+	for chunk := range secondResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected second stream error: %v", chunk.Err)
+		}
+	}
+	if got := postCalls.Load(); got != 2 {
+		t.Fatalf("HTTP fallback POST calls after second request = %d, want 2", got)
 	}
 }
 

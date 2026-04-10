@@ -1465,9 +1465,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
-
 		tried[auth.ID] = struct{}{}
+		if errTransparent := validateTransparentWebsocketExecution(auth, provider, opts); errTransparent != nil {
+			lastErr = errTransparent
+			continue
+		}
+		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1491,6 +1494,29 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		return streamResult, nil
 	}
+}
+
+func validateTransparentWebsocketExecution(auth *Auth, provider string, opts cliproxyexecutor.Options) error {
+	if !transparentWebsocketModeFromMetadata(opts.Metadata) {
+		return nil
+	}
+	if auth == nil {
+		return cliproxyexecutor.NewOpenAICompatibleError(
+			http.StatusConflict,
+			"invalid_request_error",
+			"transparent_websocket_auth_required",
+			"transparent websocket mode requires a codex websocket-enabled auth",
+		)
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || !authWebsocketsEnabled(auth) {
+		return cliproxyexecutor.NewOpenAICompatibleError(
+			http.StatusConflict,
+			"invalid_request_error",
+			"transparent_websocket_auth_required",
+			"transparent websocket mode requires a codex websocket-enabled auth",
+		)
+	}
+	return nil
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
